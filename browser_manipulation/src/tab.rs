@@ -15,6 +15,9 @@ use crate::{Act, Browser, Capture, Error, ErrorKind, Key, Keys, Motion, Point, R
 /// A hung page must not hold the error it failed with.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// CSS px kept above and below an element the viewport grew for.
+const GROWN_MARGIN: u32 = 100;
+
 /// `(el) => px`: how much of the element's height its scrolling ancestors cut off.
 const HIDDEN_HEIGHT: &str = r#"(el) => {
 	const r = el.getBoundingClientRect();
@@ -416,11 +419,14 @@ impl<'b, M: Motion> Tab<'b, M> {
 		let grown = match (hidden > 0., self.page.viewport_size()) {
 			(true, Some(v)) => {
 				let taller = playwright_rs::Viewport {
-					height: v.height + hidden.ceil() as u32,
+					height: v.height + hidden.ceil() as u32 + 2 * GROWN_MARGIN,
 					..v.clone()
 				};
 				self.page.set_viewport_size(taller).await.map_err(missing)?;
-				l.scroll_into_view_if_needed().await.map_err(missing)?;
+				// centred, clear of what sticks to the scroller's edges
+				l.evaluate::<(), ()>(r#"el => el.scrollIntoView({ block: "center", behavior: "instant" })"#, None)
+					.await
+					.map_err(missing)?;
 				Some(v)
 			}
 			_ => None, // without a viewport the window's size holds, and so does the clip

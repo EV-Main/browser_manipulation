@@ -202,8 +202,15 @@ async fn an_element_shot_is_scaled_by_its_own_scale() {
 		let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
 		let frame = reader.next_frame(&mut pixels).unwrap();
 		assert_eq!((frame.width, frame.height), (2 * css.0, 2 * css.1), "{selector}");
-		let last_row = &pixels[frame.buffer_size() - frame.line_size..];
-		assert!(last_row.chunks(frame.color_type.samples()).all(|p| p[..3] != [255, 255, 255]), "{selector} is painted to its end");
+		let row = |i: usize| {
+			pixels[i * frame.line_size..(i + 1) * frame.line_size]
+				.chunks(frame.color_type.samples())
+				.map(|p| [p[0], p[1], p[2]])
+				.collect::<Vec<_>>()
+		};
+		let last = frame.height as usize - 1;
+		assert!(row(last).iter().all(|p| *p != [255; 3]), "{selector} is painted to its end");
+		assert!(row(0).iter().all(|p| *p != [0; 3]), "nothing sticky over {selector}");
 	}
 	drop(tab);
 	browser.close().await.unwrap();
