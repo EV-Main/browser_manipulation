@@ -19,6 +19,7 @@ manual_is_multiple_of = "allow"
 unused_features = "allow"
 
 [workspace.dependencies]
+base64 = "0.23"
 bon = "3.10"
 crc32fast = "1.5"
 derive_more = "2"

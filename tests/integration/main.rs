@@ -81,6 +81,10 @@ async fn launch<M: Motion>(profile: &Path, motion: M, artifacts: Option<Artifact
 }
 
 async fn launch_at<M: Motion>(profile: &Path, device_scale_factor: f64, motion: M, artifacts: Option<Artifacts>) -> Result<Browser<M>, browser_manipulation::Error> {
+	launch_with(profile, device_scale_factor, vec![], motion, artifacts).await
+}
+
+async fn launch_with<M: Motion>(profile: &Path, device_scale_factor: f64, args: Vec<String>, motion: M, artifacts: Option<Artifacts>) -> Result<Browser<M>, browser_manipulation::Error> {
 	let launch = Launch::Owned {
 		profile: profile.to_owned(),
 		executable: chrome(),
@@ -90,6 +94,7 @@ async fn launch_at<M: Motion>(profile: &Path, device_scale_factor: f64, motion: 
 			height: 800,
 			device_scale_factor,
 		}),
+		args,
 	};
 	Browser::launch(launch, motion, artifacts).await
 }
@@ -181,6 +186,72 @@ async fn screenshots_are_scaled_by_the_device() {
 	let png = tab.screenshot(Shot::Full).await.unwrap();
 	let width = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap().info().width;
 	assert_eq!(width, 2 * 1280);
+	drop(tab);
+	browser.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_element_shot_is_scaled_by_its_own_scale() {
+	let dir = tempfile::tempdir().unwrap();
+	let browser = launch(dir.path(), Robot, None).await.unwrap();
+	let mut tab = browser.tab().await.unwrap();
+	tab.goto(&format!("{}/shot.html", fixtures())).await.unwrap();
+	for (selector, css) in [("#small", (200, 100)), ("#tall", (200, 1500)), ("#nested", (200, 1500))] {
+		let png = tab.screenshot(Shot::Element { selector, scale: 2. }).await.unwrap();
+		let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
+		let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+		let frame = reader.next_frame(&mut pixels).unwrap();
+		assert_eq!((frame.width, frame.height), (2 * css.0, 2 * css.1), "{selector}");
+		let last_row = &pixels[frame.buffer_size() - frame.line_size..];
+		assert!(last_row.chunks(frame.color_type.samples()).all(|p| p[..3] != [255, 255, 255]), "{selector} is painted to its end");
+	}
+	drop(tab);
+	browser.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn a_blocked_url_is_never_fetched() {
+	let dir = tempfile::tempdir().unwrap();
+	let browser = launch(dir.path(), Robot, None).await.unwrap();
+	let mut tab = browser.tab().await.unwrap();
+	tab.block(&["data.json"]).await.unwrap();
+	tab.goto(&format!("{}/human.html", fixtures())).await.unwrap();
+	let fetch = "(u) => fetch(u).then(r => String(r.status), () => 'refused')";
+	assert_eq!(tab.eval::<String>(fetch, "/data.json").await.unwrap(), "refused");
+	assert_eq!(tab.eval::<String>(fetch, "/late.html").await.unwrap(), "200");
+	tab.block(&[]).await.unwrap();
+	assert_eq!(tab.eval::<String>(fetch, "/data.json").await.unwrap(), "200", "a later list replaces it");
+	drop(tab);
+	browser.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn features_passed_keep_the_driver_s() {
+	let dir = tempfile::tempdir().unwrap();
+	let args = vec!["--disable-features=BmTestOff".to_owned(), "--mute-audio".to_owned()];
+	let browser = launch_with(dir.path(), 1., args, Robot, None).await.unwrap();
+	let mut tab = browser.tab().await.unwrap();
+	tab.goto("chrome://version").await.unwrap();
+	let line: String = tab.eval("document.querySelector('#command_line').innerText", ()).await.unwrap();
+	let last = line.rsplit("--disable-features=").next().unwrap().split(' ').next().unwrap();
+	let features: Vec<&str> = last.split(',').collect();
+	assert!(features.contains(&"BmTestOff") && features.contains(&"PaintHolding"), "{line}");
+	assert!(line.contains("--enable-features=CDPScreenshotNewSurface"), "{line}");
+	drop(tab);
+	browser.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn the_headed_ua_is_probed_once_per_executable() {
+	let dir = tempfile::tempdir().unwrap();
+	launch(dir.path(), Robot, None).await.unwrap().close().await.unwrap();
+	let cache = dir.path().join("browser_manipulation.ua");
+	let key = std::fs::read_to_string(&cache).unwrap().lines().next().unwrap().to_owned();
+	std::fs::write(&cache, format!("{key}\nMozilla/5.0 bm-cached\n")).unwrap();
+
+	let browser = launch(dir.path(), Robot, None).await.unwrap();
+	let mut tab = browser.tab().await.unwrap();
+	assert_eq!(tab.eval::<String>("navigator.userAgent", ()).await.unwrap(), "Mozilla/5.0 bm-cached");
 	drop(tab);
 	browser.close().await.unwrap();
 }

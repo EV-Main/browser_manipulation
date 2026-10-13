@@ -6,7 +6,7 @@ use std::{
 use futures::{Stream, StreamExt as _, channel::mpsc};
 use playwright_rs::{
 	Cookie, Locator, Page, ScreenshotOptions, WaitForOptions, WaitForState,
-	protocol::{ContinueOptions, ResponseObject},
+	protocol::{CDPSession, ContinueOptions, ResponseObject},
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -15,11 +15,27 @@ use crate::{Act, Browser, Capture, Error, ErrorKind, Key, Keys, Motion, Point, R
 /// A hung page must not hold the error it failed with.
 const CAPTURE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// `(el) => px`: how much of the element's height its scrolling ancestors cut off.
+const HIDDEN_HEIGHT: &str = r#"(el) => {
+	const r = el.getBoundingClientRect();
+	let top = r.top, bottom = r.bottom;
+	for (let a = el.parentElement; a; a = a.parentElement) {
+		if (getComputedStyle(a).overflowY === "visible") continue;
+		const c = a.getBoundingClientRect();
+		top = Math.max(top, c.top);
+		bottom = Math.min(bottom, c.bottom);
+	}
+	return r.height - Math.max(0, bottom - top);
+}"#;
 /// URL part → subscriber, fed by the one `on_response` handler a tab registers.
 type Listeners = Arc<Mutex<Vec<(String, mpsc::UnboundedSender<ResponseObject>)>>>;
 pub enum Shot<'s> {
 	Full,
-	Element(&'s str),
+	/// The first match, at `scale` pixels per CSS px whatever the device's; only it is rasterized at that scale. Beyond the viewport too.
+	Element {
+		selector: &'s str,
+		scale: f64,
+	},
 }
 
 pub struct Response {
@@ -41,6 +57,8 @@ pub struct Tab<'b, M: Motion> {
 	mouse: Point,
 	listeners: Option<Listeners>,
 	timeout: Duration,
+	/// Holds [`Self::block`]'s list: Chromium drops it with the session.
+	blocker: Option<CDPSession>,
 }
 
 impl<'b, M: Motion> Tab<'b, M> {
@@ -51,6 +69,7 @@ impl<'b, M: Motion> Tab<'b, M> {
 			mouse: Point { x: 0., y: 0. }, // where the driver's mouse starts
 			listeners: None,
 			timeout: Duration::from_secs(30), // the driver's own
+			blocker: None,
 		}
 	}
 
@@ -209,9 +228,34 @@ impl<'b, M: Motion> Tab<'b, M> {
 				.screenshot(ScreenshotOptions::builder().full_page(true).build())
 				.await
 				.map_err(|source| ErrorKind::Driver { op: "taking a screenshot", source }),
-			Shot::Element(sel) => self.page.locator(sel).screenshot(None).await.map_err(|s| classify("screenshot", sel, s)),
+			Shot::Element { selector, scale } => self.element_shot(selector, scale).await,
 		};
 		self.captured(r, "screenshot").await
+	}
+
+	/// From now on Chromium refuses every request whose URL contains any of `url_parts`, without asking the driver as [`Self::route`]
+	/// does. A later call replaces the list.
+	pub async fn block(&mut self, url_parts: &[&str]) -> Result<(), Error> {
+		let fail = |source| ErrorKind::Driver { op: "blocking requests", source };
+		let urls: Vec<String> = url_parts
+			.iter()
+			.map(|p| {
+				assert!(!p.contains('*'), "a URL part is literal: {p}");
+				format!("*{p}*")
+			})
+			.collect();
+		let session = match &self.blocker {
+			Some(s) => s,
+			None => {
+				let s = self.page.context().map_err(fail)?.new_cdp_session(&self.page).await.map_err(fail)?;
+				// the list only holds for a session with Network on; no buffer, as nothing reads bodies through it
+				let quiet = serde_json::json!({ "maxTotalBufferSize": 0, "maxResourceBufferSize": 0 });
+				s.send("Network.enable", Some(quiet)).await.map_err(fail)?;
+				self.blocker.insert(s)
+			}
+		};
+		session.send("Network.setBlockedURLs", Some(serde_json::json!({ "urls": urls }))).await.map_err(fail)?;
+		Ok(())
 	}
 
 	/// The ones a request to `url` would carry. Asked of the page, not its context: in an attached Chrome every profile's pages share one.
@@ -360,6 +404,59 @@ impl<'b, M: Motion> Tab<'b, M> {
 				capture: self.capture(hint).await.map(Box::new),
 			}),
 		}
+	}
+
+	async fn element_shot(&self, selector: &str, scale: f64) -> Result<Vec<u8>, ErrorKind> {
+		let l = self.page.locator(selector).first();
+		let missing = |s| classify("screenshot", selector, s);
+		l.wait_for(WaitForOptions::builder().state(WaitForState::Visible).build()).await.map_err(missing)?;
+		l.scroll_into_view_if_needed().await.map_err(missing)?;
+		// a scrolling ancestor clips even beyond the viewport: grow the viewport by what it hides, for this shot only
+		let hidden: f64 = l.evaluate(HIDDEN_HEIGHT, None::<()>).await.map_err(missing)?;
+		let grown = match (hidden > 0., self.page.viewport_size()) {
+			(true, Some(v)) => {
+				let taller = playwright_rs::Viewport {
+					height: v.height + hidden.ceil() as u32,
+					..v.clone()
+				};
+				self.page.set_viewport_size(taller).await.map_err(missing)?;
+				l.scroll_into_view_if_needed().await.map_err(missing)?;
+				Some(v)
+			}
+			_ => None, // without a viewport the window's size holds, and so does the clip
+		};
+		let shot = self.clip_shot(&l, selector, scale).await;
+		if let Some(v) = grown {
+			self.page.set_viewport_size(v).await.map_err(|source| ErrorKind::Driver {
+				op: "restoring the viewport",
+				source,
+			})?;
+		}
+		shot
+	}
+
+	async fn clip_shot(&self, l: &Locator, selector: &str, scale: f64) -> Result<Vec<u8>, ErrorKind> {
+		let b = l.bounding_box().await.map_err(|s| classify("screenshot", selector, s))?.expect("visible, so it has a box");
+		let fail = |source| ErrorKind::Driver { op: "taking a screenshot", source };
+		let session = self.page.context().map_err(fail)?.new_cdp_session(&self.page).await.map_err(fail)?;
+		let shot = async {
+			let metrics = session.send("Page.getLayoutMetrics", None).await?;
+			let at = &metrics["result"]["cssVisualViewport"];
+			let page = |k: &str| at[k].as_f64().unwrap_or_else(|| panic!("getLayoutMetrics always carries cssVisualViewport.{k}: {metrics}"));
+			// the box is the viewport's; a clip beyond it is the document's
+			let clip = serde_json::json!({ "x": b.x + page("pageX"), "y": b.y + page("pageY"), "width": b.width, "height": b.height, "scale": scale });
+			session
+				.send(
+					"Page.captureScreenshot",
+					Some(serde_json::json!({ "format": "png", "clip": clip, "captureBeyondViewport": true })),
+				)
+				.await
+		}
+		.await;
+		session.detach().await.map_err(fail)?;
+		let shot = shot.map_err(fail)?;
+		let data = shot["result"]["data"].as_str().unwrap_or_else(|| panic!("captureScreenshot always answers data: {shot}"));
+		Ok(base64::Engine::decode(&base64::engine::general_purpose::STANDARD, data).expect("CDP sends base64"))
 	}
 
 	async fn bbox(&self, selector: &str) -> Result<Rect, ErrorKind> {

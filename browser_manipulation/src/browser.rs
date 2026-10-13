@@ -16,6 +16,8 @@ pub enum Launch {
 		headless: bool,
 		/// `None`: the page takes the window's size and density.
 		viewport: Option<Viewport>,
+		/// Chromium switches, after the driver's own. A `--disable-features=`/`--enable-features=` here extends the driver's.
+		args: Vec<String>,
 	},
 	/// Someone else's running Chrome, by its CDP endpoint. Closing only disconnects.
 	Attach { cdp: String },
@@ -52,10 +54,14 @@ impl<M: Motion> Browser<M> {
 				executable,
 				headless,
 				viewport,
+				args,
 			} => {
-				let options = BrowserContextOptions::builder().headless(headless).executable_path(executable.display().to_string());
+				let options = BrowserContextOptions::builder()
+					.headless(headless)
+					.executable_path(executable.display().to_string())
+					.args(with_driver_features(args)?);
 				let options = match headless {
-					true => options.user_agent(headed_ua(&playwright, &executable).await?),
+					true => options.user_agent(headed_ua(&playwright, &profile, &executable).await?),
 					false => options,
 				};
 				let options = match viewport {
@@ -108,8 +114,33 @@ impl<M: Motion> Browser<M> {
 }
 
 /// Headless Chromium says `HeadlessChrome` in every UA it sends; the client hints already match headed. Read off a throwaway launch, as
-/// only a context-wide UA reaches every page, popups included, before its first request.
-async fn headed_ua(playwright: &Playwright, executable: &Path) -> Result<String, Error> {
+/// only a context-wide UA reaches every page, popups included, before its first request. Kept in the profile per executable and its
+/// mtime, so only a new Chromium pays for the second launch.
+async fn headed_ua(playwright: &Playwright, profile: &Path, executable: &Path) -> Result<String, Error> {
+	let io = |what, path: &Path| {
+		let path = path.to_owned();
+		move |source| ErrorKind::Io { what, path, source }
+	};
+	let modified = std::fs::metadata(executable).and_then(|m| m.modified()).map_err(io("reading", executable))?;
+	let key = format!("{} {modified:?}", executable.display());
+	let cache = profile.join("browser_manipulation.ua");
+	match std::fs::read_to_string(&cache) {
+		Ok(cached) => {
+			if let Some((k, ua)) = cached.split_once('\n')
+				&& k == key
+			{
+				return Ok(ua.trim_end().to_owned());
+			}
+		}
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+		Err(e) => return Err(io("reading", &cache)(e).into()),
+	}
+	let ua = probe_ua(playwright, executable).await?;
+	std::fs::write(&cache, format!("{key}\n{ua}\n")).map_err(io("writing", &cache))?;
+	Ok(ua)
+}
+
+async fn probe_ua(playwright: &Playwright, executable: &Path) -> Result<String, Error> {
 	let fail = |source| ErrorKind::Driver {
 		op: "reading the browser's UA",
 		source,
@@ -127,6 +158,67 @@ async fn headed_ua(playwright: &Playwright, executable: &Path) -> Result<String,
 		.unwrap_or_else(|| panic!("Browser.getVersion always carries userAgent: {version}"));
 	assert!(ua.contains("HeadlessChrome/"), "a headless chromium says so in its UA: {ua}");
 	Ok(ua.replace("HeadlessChrome/", "Chrome/"))
+}
+
+/// Chromium keeps only the last `--disable-features=` and `--enable-features=`, and the driver passes its own first: ours carry its list too.
+fn with_driver_features(args: Vec<String>) -> Result<Vec<String>, Error> {
+	const SWITCHES: [&str; 2] = ["--disable-features=", "--enable-features="];
+	if !args.iter().any(|a| SWITCHES.iter().any(|s| a.starts_with(s))) {
+		return Ok(args);
+	}
+	let mut lists = driver_features()?;
+	let mut out = Vec::with_capacity(args.len());
+	for arg in args {
+		match SWITCHES.iter().position(|s| arg.starts_with(s)) {
+			Some(i) =>
+				for feature in arg[SWITCHES[i].len()..].split(',').filter(|f| !f.is_empty()) {
+					if !lists[i].iter().any(|f| f == feature) {
+						lists[i].push(feature.to_owned());
+					}
+				},
+			None => out.push(arg),
+		}
+	}
+	out.extend(SWITCHES.iter().zip(lists).filter(|(_, l)| !l.is_empty()).map(|(s, l)| format!("{s}{}", l.join(","))));
+	Ok(out)
+}
+
+/// The features the driver disables and enables, as its `chromiumSwitches` spells them; the driver is pinned, so the text is too.
+fn driver_features() -> Result<[Vec<String>; 2], Error> {
+	let cli_js = std::env::var("PLAYWRIGHT_CLI_JS").expect("asserted at launch");
+	let bundle = Path::new(&cli_js).with_file_name("lib/coreBundle.js");
+	let js = std::fs::read_to_string(&bundle).map_err(|source| ErrorKind::Io {
+		what: "reading",
+		path: bundle.clone(),
+		source,
+	})?;
+	let block = |from: &str| {
+		let start = js.find(from).unwrap_or_else(|| panic!("{} has no `{from}`", bundle.display())) + from.len();
+		let len = js[start..].find("].filter(Boolean)").unwrap_or_else(|| panic!("{}: `{from}` is unterminated", bundle.display()));
+		&js[start..start + len]
+	};
+	let disabled = block("disabledFeatures = [")
+		.lines()
+		.map(str::trim)
+		.filter(|l| !l.starts_with("//"))
+		.filter_map(|l| Some(l.strip_prefix('"')?.split('"').next()?.to_owned()))
+		.collect();
+	let switches = block("chromiumSwitches = (options) => [");
+	assert!(
+		switches.contains(r#""--disable-features=" + disabledFeatures.join(",")"#),
+		"{}: chromiumSwitches no longer passes disabledFeatures",
+		bundle.display()
+	);
+	let enabled = match std::env::var_os("PLAYWRIGHT_LEGACY_SCREENSHOT") {
+		Some(_) => vec![], // the driver drops its `--enable-features` then
+		None => switches
+			.split(r#""--enable-features="#)
+			.skip(1)
+			.flat_map(|s| s.split('"').next().expect("split yields at least one piece").split(','))
+			.map(str::to_owned)
+			.collect(),
+	};
+	Ok([disabled, enabled])
 }
 
 /// playwright-rs takes whichever driver the env names; only patchright's keeps `Runtime.enable` off the page.
