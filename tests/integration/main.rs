@@ -226,6 +226,12 @@ async fn a_blocked_url_is_never_fetched() {
 	let fetch = "(u) => fetch(u).then(r => String(r.status), () => 'refused')";
 	assert_eq!(tab.eval::<String>(fetch, "/data.json").await.unwrap(), "refused");
 	assert_eq!(tab.eval::<String>(fetch, "/late.html").await.unwrap(), "200");
+	let from_worker = r#"(u) => new Promise(done => {
+		const src = `fetch("${location.origin}${u}").then(r => postMessage(String(r.status)), () => postMessage("refused"))`;
+		new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" }))).onmessage = e => done(e.data);
+	})"#;
+	assert_eq!(tab.eval::<String>(from_worker, "/data.json").await.unwrap(), "refused", "a worker's request too");
+	assert_eq!(tab.eval::<String>(from_worker, "/late.html").await.unwrap(), "200");
 	tab.block(&[]).await.unwrap();
 	assert_eq!(tab.eval::<String>(fetch, "/data.json").await.unwrap(), "200", "a later list replaces it");
 	drop(tab);

@@ -6,7 +6,7 @@ use std::{
 use futures::{Stream, StreamExt as _, channel::mpsc};
 use playwright_rs::{
 	Cookie, Locator, Page, ScreenshotOptions, WaitForOptions, WaitForState,
-	protocol::{CDPSession, ContinueOptions, ResponseObject},
+	protocol::{ContinueOptions, ResponseObject},
 };
 use serde::{Serialize, de::DeserializeOwned};
 
@@ -60,8 +60,8 @@ pub struct Tab<'b, M: Motion> {
 	mouse: Point,
 	listeners: Option<Listeners>,
 	timeout: Duration,
-	/// Holds [`Self::block`]'s list: Chromium drops it with the session.
-	blocker: Option<CDPSession>,
+	/// [`Self::block`]'s URL parts.
+	blocked: Vec<String>,
 }
 
 impl<'b, M: Motion> Tab<'b, M> {
@@ -72,7 +72,7 @@ impl<'b, M: Motion> Tab<'b, M> {
 			mouse: Point { x: 0., y: 0. }, // where the driver's mouse starts
 			listeners: None,
 			timeout: Duration::from_secs(30), // the driver's own
-			blocker: None,
+			blocked: Vec::new(),
 		}
 	}
 
@@ -236,28 +236,20 @@ impl<'b, M: Motion> Tab<'b, M> {
 		self.captured(r, "screenshot").await
 	}
 
-	/// From now on Chromium refuses every request whose URL contains any of `url_parts`, without asking the driver as [`Self::route`]
-	/// does. A later call replaces the list.
+	/// From now on every request whose URL contains any of `url_parts` is refused, the page's workers' included. A later call
+	/// replaces the list.
 	pub async fn block(&mut self, url_parts: &[&str]) -> Result<(), Error> {
 		let fail = |source| ErrorKind::Driver { op: "blocking requests", source };
-		let urls: Vec<String> = url_parts
-			.iter()
-			.map(|p| {
-				assert!(!p.contains('*'), "a URL part is literal: {p}");
-				format!("*{p}*")
-			})
-			.collect();
-		let session = match &self.blocker {
-			Some(s) => s,
-			None => {
-				let s = self.page.context().map_err(fail)?.new_cdp_session(&self.page).await.map_err(fail)?;
-				// the list only holds for a session with Network on; no buffer, as nothing reads bodies through it
-				let quiet = serde_json::json!({ "maxTotalBufferSize": 0, "maxResourceBufferSize": 0 });
-				s.send("Network.enable", Some(quiet)).await.map_err(fail)?;
-				self.blocker.insert(s)
-			}
-		};
-		session.send("Network.setBlockedURLs", Some(serde_json::json!({ "urls": urls }))).await.map_err(fail)?;
+		for part in std::mem::take(&mut self.blocked) {
+			self.page.unroute(&glob(&part)).await.map_err(fail)?;
+		}
+		for part in url_parts {
+			self.page
+				.route(&glob(part), |route| async move { route.abort(Some("blockedbyclient")).await })
+				.await
+				.map_err(fail)?;
+			self.blocked.push((*part).to_owned());
+		}
 		Ok(())
 	}
 
