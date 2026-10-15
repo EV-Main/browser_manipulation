@@ -1,7 +1,10 @@
 [package]
 name = "browser_manipulation"
-version = "0.4.3"
+version = "0.4.4"
 edition = "2024"
+description = "One Playwright-protocol browser framework: patchright driver, human-shaped Motion, capture-on-failure"
+license = "BlueOak-1.0.0"
+repository = "https://github.com/EV-Main/browser_manipulation"
 
 [dependencies]
 base64.workspace = true
