@@ -4,3 +4,4 @@
 3. The driver is `patchright-core` at exactly `playwright_rs::PLAYWRIGHT_VERSION`, asserted at launch. No fallback to the stock driver.
 4. No `Runtime.enable` reaches the page.
 5. One profile ↔ one process.
+6. An element shot scrolls on the y axis only. An element cut off on the x axis is an error, never scrolled to.

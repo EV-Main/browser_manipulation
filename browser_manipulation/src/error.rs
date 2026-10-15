@@ -1,6 +1,6 @@
 use std::{fmt, path::PathBuf};
 
-use crate::Capture;
+use crate::{Capture, Geometry};
 
 #[derive(Debug)]
 pub struct Error {
@@ -50,6 +50,8 @@ pub enum ErrorKind {
 		#[source]
 		source: playwright_rs::Error,
 	},
+	#[error("`{target}` is out of view on the x axis: {geometry:?}")]
+	OutOfView { target: String, geometry: Geometry },
 	#[error("{op}")]
 	Driver {
 		op: &'static str,
@@ -90,6 +92,7 @@ impl miette::Diagnostic for Error {
 			ErrorKind::Timeout { .. } => "bm::timeout",
 			ErrorKind::Selector { .. } => "bm::selector",
 			ErrorKind::Eval { .. } => "bm::eval",
+			ErrorKind::OutOfView { .. } => "bm::out_of_view",
 			ErrorKind::Driver { .. } => "bm::driver",
 		};
 		Some(Box::new(code))

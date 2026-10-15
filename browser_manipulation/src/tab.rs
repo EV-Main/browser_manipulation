@@ -30,15 +30,71 @@ const HIDDEN_HEIGHT: &str = r#"(el) => {
 	}
 	return r.height - Math.max(0, bottom - top);
 }"#;
+
+/// `(el) => void`: centres the element in each vertical scroller around it, then in the window. Never writes `scrollLeft`.
+const CENTRE: &str = r#"(el) => {
+	for (let s = el.parentElement; s && s !== document.scrollingElement; s = s.parentElement) {
+		if (!(s.scrollHeight > s.clientHeight && /(auto|scroll)/.test(getComputedStyle(s).overflowY))) continue;
+		const r = el.getBoundingClientRect(), c = s.getBoundingClientRect();
+		s.scrollTop += r.top + r.height / 2 - (c.top + c.height / 2);
+	}
+	const r = el.getBoundingClientRect();
+	window.scrollTo(window.scrollX, window.scrollY + r.top + r.height / 2 - innerHeight / 2);
+}"#;
+
+/// `() => void`: until a frame has been laid out and painted since.
+const SETTLE: &str = "() => new Promise(r => requestAnimationFrame(() => requestAnimationFrame(() => r())))";
+
+/// `(el, grownBy) => Geometry`
+const MEASURE: &str = r#"(el, grownBy) => {
+	const r = el.getBoundingClientRect();
+	let clipLeft = 0, clipRight = document.documentElement.clientWidth, ancestorScrollLeft = 0;
+	for (let a = el.parentElement; a && a !== document.documentElement; a = a.parentElement) {
+		ancestorScrollLeft = Math.max(ancestorScrollLeft, a.scrollLeft);
+		if (getComputedStyle(a).overflowX === "visible") continue;
+		const c = a.getBoundingClientRect();
+		clipLeft = Math.max(clipLeft, c.left);
+		clipRight = Math.min(clipRight, c.right);
+	}
+	return {
+		x: r.x, y: r.y, width: r.width, height: r.height, clipLeft, clipRight,
+		pageX: visualViewport.pageLeft, pageY: visualViewport.pageTop, viewportWidth: innerWidth, viewportHeight: innerHeight,
+		scrollLeft: document.scrollingElement.scrollLeft, ancestorScrollLeft, grownBy,
+	};
+}"#;
+
 /// URL part → subscriber, fed by the one `on_response` handler a tab registers.
 type Listeners = Arc<Mutex<Vec<(String, mpsc::UnboundedSender<ResponseObject>)>>>;
-pub enum Shot<'s> {
-	Full,
-	/// The first match, at `scale` pixels per CSS px whatever the device's; only it is rasterized at that scale. Beyond the viewport too.
-	Element {
-		selector: &'s str,
-		scale: f64,
-	},
+/// A [`Tab::element_shot`], and where the element was on the page it was taken from.
+#[derive(Debug)]
+pub struct ElementShot {
+	pub png: Vec<u8>,
+	pub geometry: Geometry,
+}
+
+/// The page as an element was shot from, in CSS px.
+#[derive(Clone, Copy, Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Geometry {
+	/// The element's box in the viewport.
+	pub x: f64,
+	pub y: f64,
+	pub width: f64,
+	pub height: f64,
+	/// What the viewport and the element's clipping ancestors leave visible on the x axis.
+	pub clip_left: f64,
+	pub clip_right: f64,
+	/// The viewport's offset into the document.
+	pub page_x: f64,
+	pub page_y: f64,
+	pub viewport_width: f64,
+	pub viewport_height: f64,
+	/// The document's.
+	pub scroll_left: f64,
+	/// The largest of the element's ancestors'.
+	pub ancestor_scroll_left: f64,
+	/// What the viewport grew by for the shot; 0 when it did not.
+	pub grown_by: u32,
 }
 
 pub struct Response {
@@ -224,16 +280,21 @@ impl<'b, M: Motion> Tab<'b, M> {
 		self.captured(r, "content").await
 	}
 
-	pub async fn screenshot(&mut self, shot: Shot<'_>) -> Result<Vec<u8>, Error> {
-		let r = match shot {
-			Shot::Full => self
-				.page
-				.screenshot(ScreenshotOptions::builder().full_page(true).build())
-				.await
-				.map_err(|source| ErrorKind::Driver { op: "taking a screenshot", source }),
-			Shot::Element { selector, scale } => self.element_shot(selector, scale).await,
-		};
+	/// The whole page.
+	pub async fn screenshot(&mut self) -> Result<Vec<u8>, Error> {
+		let r = self
+			.page
+			.screenshot(ScreenshotOptions::builder().full_page(true).build())
+			.await
+			.map_err(|source| ErrorKind::Driver { op: "taking a screenshot", source });
 		self.captured(r, "screenshot").await
+	}
+
+	/// The first match, at `scale` pixels per CSS px whatever the device's; only it is rasterized at that scale. Scrolled into view on
+	/// the y axis only: one cut off on the x axis is [`ErrorKind::OutOfView`].
+	pub async fn element_shot(&mut self, selector: &str, scale: f64) -> Result<ElementShot, Error> {
+		let r = self.shoot_element(selector, scale).await;
+		self.captured(r, "element_shot").await
 	}
 
 	/// From now on every request whose URL contains any of `url_parts` is refused, the page's workers' included. A later call
@@ -401,30 +462,40 @@ impl<'b, M: Motion> Tab<'b, M> {
 		}
 	}
 
-	async fn element_shot(&self, selector: &str, scale: f64) -> Result<Vec<u8>, ErrorKind> {
+	async fn shoot_element(&self, selector: &str, scale: f64) -> Result<ElementShot, ErrorKind> {
 		let l = self.page.locator(selector).first();
 		let missing = |s| classify("screenshot", selector, s);
 		l.wait_for(WaitForOptions::builder().state(WaitForState::Visible).build()).await.map_err(missing)?;
-		l.scroll_into_view_if_needed().await.map_err(missing)?;
+		l.evaluate::<(), ()>(CENTRE, None).await.map_err(missing)?;
 		// a scrolling ancestor clips even beyond the viewport: grow the viewport by what it hides, for this shot only
 		let hidden: f64 = l.evaluate(HIDDEN_HEIGHT, None::<()>).await.map_err(missing)?;
 		let grown = match (hidden > 0., self.page.viewport_size()) {
 			(true, Some(v)) => {
-				let taller = playwright_rs::Viewport {
-					height: v.height + hidden.ceil() as u32 + 2 * GROWN_MARGIN,
-					..v.clone()
-				};
+				let by = hidden.ceil() as u32 + 2 * GROWN_MARGIN;
+				let taller = playwright_rs::Viewport { height: v.height + by, ..v.clone() };
 				self.page.set_viewport_size(taller).await.map_err(missing)?;
+				self.page.evaluate::<(), ()>(SETTLE, None).await.map_err(missing)?; // the page lays itself out again for the new size
 				// centred, clear of what sticks to the scroller's edges
-				l.evaluate::<(), ()>(r#"el => el.scrollIntoView({ block: "center", behavior: "instant" })"#, None)
-					.await
-					.map_err(missing)?;
-				Some(v)
+				l.evaluate::<(), ()>(CENTRE, None).await.map_err(missing)?;
+				Some((v, by))
 			}
 			_ => None, // without a viewport the window's size holds, and so does the clip
 		};
-		let shot = self.clip_shot(&l, selector, scale).await;
-		if let Some(v) = grown {
+		let shot = async {
+			self.page.evaluate::<(), ()>(SETTLE, None).await.map_err(missing)?;
+			let grown_by = grown.as_ref().map_or(0, |(_, by)| *by);
+			let geometry: Geometry = l.evaluate(MEASURE, Some(grown_by)).await.map_err(missing)?;
+			if geometry.x < geometry.clip_left - 0.5 || geometry.x + geometry.width > geometry.clip_right + 0.5 {
+				return Err(ErrorKind::OutOfView {
+					target: selector.to_owned(),
+					geometry,
+				});
+			}
+			let png = self.clip_shot(&geometry, scale).await?;
+			Ok(ElementShot { png, geometry })
+		}
+		.await;
+		if let Some((v, _)) = grown {
 			self.page.set_viewport_size(v).await.map_err(|source| ErrorKind::Driver {
 				op: "restoring the viewport",
 				source,
@@ -433,24 +504,19 @@ impl<'b, M: Motion> Tab<'b, M> {
 		shot
 	}
 
-	async fn clip_shot(&self, l: &Locator, selector: &str, scale: f64) -> Result<Vec<u8>, ErrorKind> {
-		let b = l.bounding_box().await.map_err(|s| classify("screenshot", selector, s))?.expect("visible, so it has a box");
+	async fn clip_shot(&self, g: &Geometry, scale: f64) -> Result<Vec<u8>, ErrorKind> {
 		let fail = |source| ErrorKind::Driver { op: "taking a screenshot", source };
+		// in view, the frame is shot as laid out; beyond it, Chromium resizes the view for the capture and the page may lay out again
+		let beyond = g.y < 0. || g.y + g.height > g.viewport_height;
+		// the box is the viewport's; a clip is the document's
+		let clip = serde_json::json!({ "x": g.x + g.page_x, "y": g.y + g.page_y, "width": g.width, "height": g.height, "scale": scale });
 		let session = self.page.context().map_err(fail)?.new_cdp_session(&self.page).await.map_err(fail)?;
-		let shot = async {
-			let metrics = session.send("Page.getLayoutMetrics", None).await?;
-			let at = &metrics["result"]["cssVisualViewport"];
-			let page = |k: &str| at[k].as_f64().unwrap_or_else(|| panic!("getLayoutMetrics always carries cssVisualViewport.{k}: {metrics}"));
-			// the box is the viewport's; a clip beyond it is the document's
-			let clip = serde_json::json!({ "x": b.x + page("pageX"), "y": b.y + page("pageY"), "width": b.width, "height": b.height, "scale": scale });
-			session
-				.send(
-					"Page.captureScreenshot",
-					Some(serde_json::json!({ "format": "png", "clip": clip, "captureBeyondViewport": true })),
-				)
-				.await
-		}
-		.await;
+		let shot = session
+			.send(
+				"Page.captureScreenshot",
+				Some(serde_json::json!({ "format": "png", "clip": clip, "captureBeyondViewport": beyond })),
+			)
+			.await;
 		session.detach().await.map_err(fail)?;
 		let shot = shot.map_err(fail)?;
 		let data = shot["result"]["data"].as_str().unwrap_or_else(|| panic!("captureScreenshot always answers data: {shot}"));

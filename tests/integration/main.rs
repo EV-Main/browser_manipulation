@@ -6,7 +6,7 @@ use std::{
 	time::Duration,
 };
 
-use browser_manipulation::{Act, Artifacts, Browser, ErrorKind, Keys, Launch, Motion, Noise, Point, Rect, Robot, Shot, Viewport};
+use browser_manipulation::{Act, Artifacts, Browser, ErrorKind, Keys, Launch, Motion, Noise, Point, Rect, Robot, Viewport};
 use futures::StreamExt as _;
 
 /// Serves `tests/fixtures`; `file://` pages can't `fetch`.
@@ -183,7 +183,7 @@ async fn screenshots_are_scaled_by_the_device() {
 	let browser = launch_at(dir.path(), 2., Robot, None).await.unwrap();
 	let mut tab = browser.tab().await.unwrap();
 	tab.goto(&format!("{}/human.html", fixtures())).await.unwrap();
-	let png = tab.screenshot(Shot::Full).await.unwrap();
+	let png = tab.screenshot().await.unwrap();
 	let width = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap().info().width;
 	assert_eq!(width, 2 * 1280);
 	drop(tab);
@@ -197,7 +197,7 @@ async fn an_element_shot_is_scaled_by_its_own_scale() {
 	let mut tab = browser.tab().await.unwrap();
 	tab.goto(&format!("{}/shot.html", fixtures())).await.unwrap();
 	for (selector, css) in [("#small", (200, 100)), ("#tall", (200, 1500)), ("#nested", (200, 1500))] {
-		let png = tab.screenshot(Shot::Element { selector, scale: 2. }).await.unwrap();
+		let png = tab.element_shot(selector, 2.).await.unwrap().png;
 		let mut reader = png::Decoder::new(std::io::Cursor::new(png)).read_info().unwrap();
 		let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
 		let frame = reader.next_frame(&mut pixels).unwrap();
@@ -212,6 +212,36 @@ async fn an_element_shot_is_scaled_by_its_own_scale() {
 		assert!(row(last).iter().all(|p| *p != [255; 3]), "{selector} is painted to its end");
 		assert!(row(0).iter().all(|p| *p != [0; 3]), "nothing sticky over {selector}");
 	}
+	drop(tab);
+	browser.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn an_element_shot_never_scrolls_sideways() {
+	let dir = tempfile::tempdir().unwrap();
+	let browser = launch(dir.path(), Robot, None).await.unwrap();
+	let mut tab = browser.tab().await.unwrap();
+	tab.goto(&format!("{}/shot_x.html", fixtures())).await.unwrap();
+	let scroll = r#"() => { const s = document.getElementById("strip"); return [s.scrollLeft, s.scrollTop]; }"#;
+
+	let shot = tab.element_shot("#below", 1.).await.unwrap();
+	let (left, top): (f64, f64) = tab.eval(scroll, ()).await.unwrap();
+	assert_eq!(left, 0.);
+	assert!(top > 0., "scrolled down to it");
+	assert_eq!((shot.geometry.scroll_left, shot.geometry.ancestor_scroll_left), (0., 0.));
+	let mut reader = png::Decoder::new(std::io::Cursor::new(shot.png)).read_info().unwrap();
+	let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+	let frame = reader.next_frame(&mut pixels).unwrap();
+	assert_eq!((frame.width, frame.height), (200, 100));
+	assert!(
+		pixels[..frame.buffer_size()].chunks(frame.color_type.samples()).all(|p| p[..3] == [0x33, 0xcc, 0x33]),
+		"the shot is the element and nothing beside it"
+	);
+
+	let e = tab.element_shot("#aside", 1.).await.unwrap_err();
+	assert!(matches!(*e.kind, ErrorKind::OutOfView { .. }), "{e}");
+	let (left, _): (f64, f64) = tab.eval(scroll, ()).await.unwrap();
+	assert_eq!(left, 0., "not scrolled to");
 	drop(tab);
 	browser.close().await.unwrap();
 }
