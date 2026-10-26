@@ -18,6 +18,9 @@ manual_is_multiple_of = "allow"
 [workspace.lints.rust]
 unused_features = "allow"
 
+[workspace.lints.cargo]
+non_kebab_case_bins = "allow"
+
 [workspace.dependencies]
 base64 = "0.23"
 bon = "3.10"
