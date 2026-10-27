@@ -306,7 +306,12 @@ impl<'b, M: Motion> Tab<'b, M> {
 		}
 		for part in url_parts {
 			self.page
-				.route(&glob(part), |route| async move { route.abort(Some("blockedbyclient")).await })
+				.route(&glob(part), |route| async move {
+					match route.abort(Some("blockedbyclient")).await {
+						Err(playwright_rs::Error::ProtocolError(m)) if m.starts_with("Target page, context or browser has been closed") => Ok(()), // the request went with its page
+						r => r,
+					}
+				})
 				.await
 				.map_err(fail)?;
 			self.blocked.push((*part).to_owned());

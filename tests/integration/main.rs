@@ -269,6 +269,31 @@ async fn a_blocked_url_is_never_fetched() {
 }
 
 #[tokio::test]
+async fn closing_a_tab_mid_request_to_a_blocked_url_warns_of_nothing() {
+	use tracing_subscriber::layer::SubscriberExt as _;
+	struct Warns(Arc<Mutex<Vec<String>>>);
+	impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Warns {
+		fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+			if *event.metadata().level() <= tracing::Level::WARN {
+				self.0.lock().unwrap().push(format!("{event:?}"));
+			}
+		}
+	}
+	let warns = Arc::new(Mutex::new(Vec::new()));
+	let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(Warns(warns.clone())));
+	let dir = tempfile::tempdir().unwrap();
+	let browser = launch(dir.path(), Robot, None).await.unwrap();
+	let mut tab = browser.tab().await.unwrap();
+	tab.block(&["data.json"]).await.unwrap();
+	tab.goto(&format!("{}/human.html", fixtures())).await.unwrap();
+	tab.eval::<()>("() => { for (let i = 0; i < 200; i++) fetch('/data.json').catch(() => {}) }", ()).await.unwrap();
+	tab.close().await.unwrap();
+	tokio::time::sleep(Duration::from_millis(500)).await;
+	browser.close().await.unwrap();
+	assert_eq!(*warns.lock().unwrap(), Vec::<String>::new());
+}
+
+#[tokio::test]
 async fn features_passed_keep_the_driver_s() {
 	let dir = tempfile::tempdir().unwrap();
 	let args = vec!["--disable-features=BmTestOff".to_owned(), "--mute-audio".to_owned()];
