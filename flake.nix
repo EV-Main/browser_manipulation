@@ -43,6 +43,33 @@
             cp -r . $out/package/
           '';
         };
+        # The Chromium `patchright` was released against, at the revision its browsers.json names; it builds only when the binary says that version.
+        headless-shell =
+          let
+            version = "153.0.8010.12";
+            platform = { x86_64-linux = "linux64"; aarch64-linux = "linux-arm64"; }.${system};
+          in
+          pkgs.playwright-driver.components.chromium-headless-shell.overrideAttrs {
+            name = "chrome-headless-shell-${version}";
+            src = pkgs.fetchzip {
+              url = "https://cdn.playwright.dev/builds/cft/${version}/${platform}/chrome-headless-shell-${platform}.zip";
+              stripRoot = false;
+              hash = {
+                x86_64-linux = "sha256-GLqqZOwtnJig+ZCIT8FYsIxZGSFTmRwLbqNXeSOdJXA=";
+                aarch64-linux = "sha256-7DSqFxtk8Jf4/ktoW1MmH5vHs5LEp7jNvglYRoKXBm4=";
+              }.${system};
+            };
+            preFixup = ''
+              mkdir $out/bin
+              ln -s $out/chrome-headless-shell-${platform}/chrome-headless-shell $out/bin/chrome-headless-shell
+            '';
+            doInstallCheck = true;
+            installCheckPhase = ''
+              want="Google Chrome for Testing $(${pkgs.jq}/bin/jq -r '.browsers[] | select(.name == "chromium-headless-shell") | .browserVersion' ${patchright}/package/browsers.json)"
+              got="$($out/bin/chrome-headless-shell --version)"
+              [ "$got" = "$want" ] || { echo "patchright-core ${patchright.version} drives '$want', this is '$got'" >&2; exit 1; }
+            '';
+          };
         driverEnv = {
           PLAYWRIGHT_CLI_JS = "${patchright}/package/cli.js";
           PLAYWRIGHT_NODE_EXE = "${pkgs.nodejs}/bin/node";
@@ -97,7 +124,7 @@
               src = pkgs.lib.cleanSource ./.;
             };
             inherit patchright;
-          };
+          } // pkgs.lib.optionalAttrs pkgs.stdenv.isLinux { inherit headless-shell; };
 
         apps.help = {
           type = "app";
@@ -105,6 +132,7 @@
             cat <<EOF
             nix run .#integration    the test suite, with the chrome and driver it drives
             nix build .#patchright   the driver consumers point PLAYWRIGHT_CLI_JS at
+            nix build .#headless-shell  the Chromium that driver drives, at bin/chrome-headless-shell
             nix develop              dev shell; regenerates CI workflows and README
             EOF
           ''}/bin/help";

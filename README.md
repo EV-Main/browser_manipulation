@@ -14,7 +14,7 @@ One Playwright-protocol browser framework for every consumer: patchright driver 
 <h2>Installation</h2>
 </summary>
 
-Needs the `patchright-core` driver at `playwright_rs::PLAYWRIGHT_VERSION`: consume this flake's `packages.patchright` and set `PLAYWRIGHT_CLI_JS=${patchright}/package/cli.js`, `PLAYWRIGHT_NODE_EXE=${nodejs}/bin/node`, `PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD=1`.
+Needs the `patchright-core` driver at `playwright_rs::PLAYWRIGHT_VERSION`: consume this flake's `packages.patchright` and set `PLAYWRIGHT_CLI_JS=${patchright}/package/cli.js`, `PLAYWRIGHT_NODE_EXE=${nodejs}/bin/node`, `PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD=1`. The headless Chromium that driver was released against is `packages.headless-shell` (`${headless-shell}/bin/chrome-headless-shell`, Linux).
 
 </details>
 <!-- markdownlint-restore -->
