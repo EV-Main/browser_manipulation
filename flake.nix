@@ -76,6 +76,15 @@
           PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD = "1";
           BM_TEST_CHROME = "${pkgs.chromium}/bin/chromium";
         };
+        integration = pkgs.writeShellApplication {
+          name = "integration";
+          runtimeInputs = [ rust pkgs.mold pkgs.pkg-config pkgs.nodejs pkgs.chromium stdenv.cc ];
+          text = ''
+            export PKG_CONFIG_PATH=${pkgs.openssl.dev}/lib/pkgconfig LD_LIBRARY_PATH=${pkgs.openssl.out}/lib
+            export RUSTC_WRAPPER="" ${pkgs.lib.concatStringsSep " " (pkgs.lib.mapAttrsToList (k: v: "${k}=${v}") driverEnv)}
+            cargo test
+          '';
+        };
         github = v_flakes.github {
           inherit pkgs pname rs;
           enable = true;
@@ -84,7 +93,7 @@
             default = true;
             errors = {
               exclude = [ "rust-tests" ]; # the integration tests need the devShell's chrome and driver
-              augment = [{ name = "flake-app"; args.app = "integration"; }];
+              augment = [{ name = "integration"; program = integration; }];
             };
           };
         };
@@ -118,7 +127,7 @@
               nativeBuildInputs = with pkgs; [ pkg-config ];
               RUSTC_WRAPPER = ""; # .cargo/config.toml sets sccache, absent in the sandbox
               PLAYWRIGHT_SKIP_DRIVER_DOWNLOAD = "1";
-              doCheck = false; # every test drives a chrome: `nix run .#integration`
+              doCheck = false; # every test drives a chrome: `nix run .#test integration`
 
               cargoLock.lockFile = ./Cargo.lock;
               src = pkgs.lib.cleanSource ./.;
@@ -130,25 +139,12 @@
           type = "app";
           program = "${pkgs.writeShellScriptBin "help" ''
             cat <<EOF
-            nix run .#integration    the test suite, with the chrome and driver it drives
+            nix run .#test           the checks, the integration tests with the chrome and driver they drive
             nix build .#patchright   the driver consumers point PLAYWRIGHT_CLI_JS at
             nix build .#headless-shell  the Chromium that driver drives, at bin/chrome-headless-shell
             nix develop              dev shell; regenerates CI workflows and README
             EOF
           ''}/bin/help";
-        };
-
-        apps.integration = {
-          type = "app";
-          program = "${pkgs.writeShellApplication {
-            name = "integration";
-            runtimeInputs = [ rust pkgs.mold pkgs.pkg-config pkgs.nodejs pkgs.chromium stdenv.cc ];
-            text = ''
-              export PKG_CONFIG_PATH=${pkgs.openssl.dev}/lib/pkgconfig LD_LIBRARY_PATH=${pkgs.openssl.out}/lib
-              export RUSTC_WRAPPER="" ${pkgs.lib.concatStringsSep " " (pkgs.lib.mapAttrsToList (k: v: "${k}=${v}") driverEnv)}
-              cargo test
-            '';
-          }}/bin/integration";
         };
 
         devShells.default =
