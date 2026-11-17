@@ -493,7 +493,7 @@ impl<'b, M: Motion> Tab<'b, M> {
 			if geometry.x < geometry.clip_left - 0.5 || geometry.x + geometry.width > geometry.clip_right + 0.5 {
 				return Err(ErrorKind::OutOfView {
 					target: selector.to_owned(),
-					geometry,
+					geometry: Box::new(geometry),
 				});
 			}
 			let png = self.clip_shot(&geometry, scale).await?;

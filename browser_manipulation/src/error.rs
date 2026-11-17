@@ -51,7 +51,7 @@ pub enum ErrorKind {
 		source: playwright_rs::Error,
 	},
 	#[error("`{target}` is out of view on the x axis: {geometry:?}")]
-	OutOfView { target: String, geometry: Geometry },
+	OutOfView { target: String, geometry: Box<Geometry> },
 	#[error("{op}")]
 	Driver {
 		op: &'static str,
