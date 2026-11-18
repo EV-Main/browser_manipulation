@@ -79,7 +79,8 @@ fn with_text(png: &[u8], entries: &[(&str, &str)]) -> Result<Vec<u8>, String> {
 	let mut out = Vec::with_capacity(png.len() + entries.len() * 64);
 	out.extend_from_slice(&png[..IHDR_END]);
 	for (key, value) in entries {
-		assert!((1..=79).contains(&key.len()) && key.bytes().all(|b| (32..=126).contains(&b)), "bad tEXt keyword {key:?}");
+		assert!((1..=79).contains(&key.len()), "bad tEXt keyword {key:?}");
+		assert!(key.bytes().all(|b| (32..=126).contains(&b)), "bad tEXt keyword {key:?}");
 		let mut data = Vec::with_capacity(key.len() + 1 + value.len());
 		data.extend_from_slice(key.as_bytes());
 		data.push(0);
