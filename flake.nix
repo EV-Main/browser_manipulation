@@ -85,10 +85,12 @@
             cargo test
           '';
         };
+        oldestSupportedVersion = "nightly-2026-06-29";
+        newestSupportedNightly = "nightly-2026-09-28";
         github = v_flakes.github {
           inherit pkgs pname rs;
           enable = true;
-          lastSupportedVersion = "nightly-2026-09-28";
+          inherit oldestSupportedVersion; inherit newestSupportedNightly;
           jobs = {
             default = true;
             errors = {
@@ -100,9 +102,9 @@
         readme = v_flakes.readme-fw {
           inherit pkgs pname;
           defaults = true;
-          lastSupportedVersion = "nightly-1.100";
+          inherit oldestSupportedVersion; inherit newestSupportedNightly;
           rootDir = ./.;
-          badges = [ "msrv" "crates_io" "docs_rs" "loc" "ci" ];
+          badges = [ "msrv" "newest_nightly" "crates_io" "docs_rs" "loc" "ci" ];
         };
         combined = v_flakes.utils.combine { inherit rust; modules = [ rs github readme ]; };
       in
