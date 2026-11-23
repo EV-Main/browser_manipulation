@@ -86,11 +86,10 @@
           '';
         };
         oldestSupportedVersion = "nightly-2026-06-29";
-        newestSupportedNightly = "nightly-2026-09-28";
         github = v_flakes.github {
           inherit pkgs pname rs;
           enable = true;
-          inherit oldestSupportedVersion; inherit newestSupportedNightly;
+          inherit oldestSupportedVersion;
           jobs = {
             default = true;
             errors = {
@@ -102,9 +101,9 @@
         readme = v_flakes.readme-fw {
           inherit pkgs pname;
           defaults = true;
-          inherit oldestSupportedVersion; inherit newestSupportedNightly;
+          inherit oldestSupportedVersion;
           rootDir = ./.;
-          badges = [ "msrv" "newest_nightly" "crates_io" "docs_rs" "loc" "ci" ];
+          badges = [ "msrv" "crates_io" "docs_rs" "loc" "ci" ];
         };
         combined = v_flakes.utils.combine { inherit rust; modules = [ rs github readme ]; };
       in
