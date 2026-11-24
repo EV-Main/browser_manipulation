@@ -32,7 +32,7 @@ derive_more = "2"
 futures = "0.3"
 jiff = "0.2"
 miette = { version = "^7.6.0", features = ["fancy", "serde", "syntect-highlighter"] }
-playwright-rs = "=0.19.0"
+playwright-rs = { version = "=0.19.0", default-features = false, features = ["macros", "ring", "route-service", "rustls-tls-native-roots"] }
 png = "0.18"
 rand = "0.9"
 serde = "1"
